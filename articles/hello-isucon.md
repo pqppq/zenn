@@ -142,6 +142,9 @@ cd bench
 ./bench -all-addresses 127.0.0.11 -target 127.0.0.11:3000 -jia-service-url http://127.0.0.1:4999
 ```
 
+pprof の設定
+(https://github.com/Nagarei/isucon11-qualify-test/commit/0153056b705a7b6c265244e45840c8c3a1a134f6)
+
 alp でアクセスログを見てみる
 ※alp の v1.0.0 には-f オプションが無い
 uri ごとのリクエストカウント、ステータス・処理時間・ボディサイズの統計が出力される。
@@ -741,3 +744,95 @@ $ sudo cat /var/log/nginx/access.log | alp ltsv
 |     1 |   0 |   1 |   0 |   0 |   0 | GET    | /api/isu/6412e341-aed7-43df-931d-4be7c21a162c       |  0.000 |  0.000 |  0.000 | 0.000 |  0.000 |  0.000 |  0.000 |  0.000 |    145.000 |    145.000 |      145.000 |    145.000 |
 +-------+-----+-----+-----+-----+-----+--------+-----------------------------------------------------+--------+--------+--------+-------+--------+--------+--------+--------+------------+------------+--------------+------------+
 ```
+
+遅いクエリのログを取得する設定を行う。
+/etc/mysql/my.cnf
+
+```
+[mysqld]
+slow_query_log=1
+long_query_time=1 # threshold time to log
+log_queries_not_using_indexes=1
+```
+
+ボトルネックとなっているクエリの一部
+
+```
+# Uer@Host: isucon[isucon] @ localhost [127.0.0.1]
+# Thread_id: 37  Schema: isucondition  QC_hit: No
+# Query_time: 0.000396  Lock_time: 0.000016  Rows_sent: 5  Rows_examined: 28
+# Rows_affected: 0  Bytes_sent: 65166
+use isucondition;
+SET timestamp=1652582792;
+SELECT * FROM `isu` WHERE `jia_user_id` = 'isucon1' ORDER BY `id` DESC;
+
+# User@Host: isucon[isucon] @ localhost [127.0.0.1]
+# Thread_id: 37  Schema: isucondition  QC_hit: No
+# Query_time: 0.000333  Lock_time: 0.000016  Rows_sent: 1  Rows_examined: 619
+# Rows_affected: 0  Bytes_sent: 731
+SET timestamp=1652582792;
+SELECT * FROM `isu_condition` WHERE `jia_isu_uuid` = '8fb74e6e-4f8d-4a33-9862-dbcdc0712c7e' ORDER BY `timestamp` DESC LIMIT 1;
+
+# User@Host: isucon[isucon] @ localhost [127.0.0.1]
+# Thread_id: 37  ScheUma: isucondition  QC_hit: No
+# Query_time: 0.000365  Lock_time: 0.000015  Rows_sent: 2  Rows_examined: 620
+# Rows_affected: 0  Bytes_sent: 929
+SET timestamp=1652582792;
+SELECT * FROM `isu_condition` WHERE `jia_isu_uuid` = '15063e10-26fc-4dac-ae3a-1f195e0c6c4a'     AND `timestamp` < '2021-06-03 17:59:09' AND '2021-06-03 13:59:09' <= `timestamp`        ORDER BY `timestamp` DESC;
+```
+
+EXPLAIN ステートメントを使って遅いクエリにインデックスが効いているかどうかを確認する。
+
+```
+MariaDB [isucondition]> EXPLAIN SELECT * FROM `isu` WHERE `jia_user_id` = 'isucon1' ORDER BY `id` DESC;
++------+-------------+-------+-------+---------------+---------+---------+------+------+-------------+
+| id   | select_type | table | type  | possible_keys | key     | key_len | ref  | rows | Extra       |
++------+-------------+-------+-------+---------------+---------+---------+------+------+-------------+
+|    1 | SIMPLE      | isu   | index | NULL          | PRIMARY | 8       | NULL |   70 | Using where |
++------+-------------+-------+-------+---------------+---------+---------+------+------+-------------+
+1 row in set (0.000 sec)
+
+MariaDB [isucondition]> EXPLAIN  SELECT * FROM `isu_condition` WHERE `jia_isu_uuid` = '8fb74e6e-4f8d-4a33-9862-dbcdc0712c7e' ORDER BY `timestamp` DESC LIMIT 1;
++------+-------------+---------------+------+---------------+------+---------+------+-------+-----------------------------+
+| id   | select_type | table         | type | possible_keys | key  | key_len | ref  | rows  | Extra                       |
++------+-------------+---------------+------+---------------+------+---------+------+-------+-----------------------------+
+|    1 | SIMPLE      | isu_condition | ALL  | NULL          | NULL | NULL    | NULL | 36381 | Using where; Using filesort |
++------+-------------+---------------+------+---------------+------+---------+------+-------+-----------------------------+
+1 row in set (0.000 sec)
+
+MariaDB [isucondition]> EXPLAIN SELECT * FROM `isu_condition` WHERE `jia_isu_uuid` = '15063e10-26fc-4dac-ae3a-1f195e0c6c4a'     AND `timestamp` < '2021-06-03 17:59:09' AND '2021-06-03 13:59:09' <= `timestamp`        ORDER BY `timestamp` DESC;
++------+-------------+---------------+------+---------------+------+---------+------+-------+-----------------------------+
+| id   | select_type | table         | type | possible_keys | key  | key_len | ref  | rows  | Extra                       |
++------+-------------+---------------+------+---------------+------+---------+------+-------+-----------------------------+
+|    1 | SIMPLE      | isu_condition | ALL  | NULL          | NULL | NULL    | NULL | 36381 | Using where; Using filesort |
++------+-------------+---------------+------+---------------+------+---------+------+-------+-----------------------------+
+1 row in set (0.000 sec)
+```
+
+key が NULL なのでインデックスは使用されておらず、possible_keys も NULL なのでインデックスを貼る必要がある。
+[EXPLAIN 出力フォーマット](https://dev.mysql.com/doc/refman/8.0/ja/explain-output.html)
+
+/home/isucon/webapp/sql の sql ファイルを変更し、必用なら init.sh に処理を追記する。
+
+- 同一の ISU に対して、コンディションの timestamp は重複しない
+- アプリケーションコードで id は使用されていない(AUTO_INCREMENT する必要がない)
+  ので、以下の変更を加える。
+
+```diff sql
+CREATE TABLE `isu_condition` (
+-	`id` bigint AUTO_INCREMENT,
++	`id` bigint DEFAULT 0,
+ 	`jia_isu_uuid` CHAR(36) NOT NULL,
+ 	`timestamp` DATETIME NOT NULL,
+ 	`is_sitting` TINYINT(1) NOT NULL,
+ 	`condition` VARCHAR(255) NOT NULL,
+ 	`message` VARCHAR(255) NOT NULL,
+ 	`created_at` DATETIME(6) DEFAULT CURRENT_TIMEST,
+-	PRIMARY KEY(`id`),
++	PRIMARY KEY(`jia_isu_uuid`, `timestamp`),
+) ENGINE=InnoDB DEFAULT CHARACTER SET=utf8mb4;
+```
+
+Reference
+
+- [ISUCON11 予選に参加して自己ベストを更新しました](https://t-yng.jp/post/isucon11)
